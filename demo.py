@@ -13,121 +13,7 @@ from tqdm.auto import tqdm   # add at top of file
 import torch
 from PIL import Image
 
-# -------------------------------------------------------------------#
-#  Constants                                                          #
-# -------------------------------------------------------------------#
-MODEL_ID   = "Qwen/Qwen2.5-VL-7B-Instruct" 
-MIN_PIXELS = 1280 * 28 * 28            # 1 003 520
-MAX_PIXELS = 16384 * 28 * 28           # 12 843 776
 
-# -------------------------------------------------------------------#
-#  Cheap fall‑back helpers for the library utilities (`smp`)          #
-# -------------------------------------------------------------------#
-def get_rank_and_world_size() -> Tuple[int, int]:
-    """Assume single‑GPU unless run under torch.distributed."""
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(), torch.distributed.get_world_size()
-    return 0, 1
-
-def get_gpu_memory():
-    mems = []
-    for idx in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(idx)
-        mems.append(props.total_memory // 2**20)         # MiB
-    return mems
-
-def auto_split_flag() -> bool:
-    return os.environ.get("AUTO_SPLIT", "0") == "1"
-
-# -------------------------------------------------------------------#
-#  72‑B device‑map splitter (copied from the official repo)           #
-# -------------------------------------------------------------------#
-def _split_model_72b() -> Dict[str, int]:
-    device_map: Dict[str, int] = {}
-    total_gpus = torch.cuda.device_count()
-    rank, world_size = get_rank_and_world_size()
-    num_gpus = max(1, total_gpus // world_size)
-
-    num_layers = 80 + 8                       # 80 transformer + 8 visual
-    layers_per_gpu = math.ceil(num_layers / num_gpus)
-    dist = [layers_per_gpu] * num_gpus
-    dist[0]  -= 6
-    dist[-1] -= 2
-
-    layer = 0
-    for g, n in enumerate(dist):
-        for _ in range(n):
-            device_map[f"model.layers.{layer}"] = rank + g * world_size
-            layer += 1
-
-    last_gpu = rank + (num_gpus - 1) * world_size
-    device_map.update({
-        "visual":              rank,
-        "model.embed_tokens":  rank,
-        "model.norm":          last_gpu,
-        "model.rotary_emb":    last_gpu,
-        "lm_head":             last_gpu,
-    })
-    return device_map
-
-# -------------------------------------------------------------------#
-#  Library‑compatible model & processor loader                        #
-# -------------------------------------------------------------------#
-@lru_cache(maxsize=1)
-def load_qwen(model_path: str = MODEL_ID):
-    """Return (processor, model) with the same logic as Qwen2VLChat."""
-    if any(x in model_path.lower() for x in ("2.5", "2_5", "qwen25")):
-        from transformers import (
-            Qwen2_5_VLForConditionalGeneration as QwenModel,
-            AutoProcessor as QwenProcessor,
-        )
-    else:
-        from transformers import (
-            Qwen2VLForConditionalGeneration  as QwenModel,
-            Qwen2VLProcessor                 as QwenProcessor,
-        )
-    processor = QwenProcessor.from_pretrained(model_path, trust_remote_code=True)
-
-    gpu_mems     = get_gpu_memory()
-    auto_split   = auto_split_flag()
-    device_map: str | Dict[str, int]
-
-    if "72b" in model_path.lower():               # big model
-        device_map = _split_model_72b()
-    elif auto_split and get_rank_and_world_size()[1] == 1:
-        device_map = "auto"
-    else:
-        device_map = "cpu"                        # will .cuda() later if possible
-
-    model = QwenModel.from_pretrained(
-        model_path,
-        torch_dtype="auto",
-        device_map=device_map,
-        attn_implementation="flash_attention_2",
-        trust_remote_code=True,
-    )
-    if device_map == "cpu" and torch.cuda.is_available():
-        model = model.cuda()
-    model.eval()
-    torch.cuda.empty_cache()
-    return processor, model
-
-# -------------------------------------------------------------------#
-#  Image preparation                                                  #
-# -------------------------------------------------------------------#
-def _resize(img: Image.Image) -> Image.Image:
-    w, h = img.size
-    p = w * h
-    if MIN_PIXELS <= p <= MAX_PIXELS:
-        return img
-    tgt_p  = max(min(p, MAX_PIXELS), MIN_PIXELS)
-    scale  = (tgt_p / p) ** 0.5
-    new_wh = (int(w * scale), int(h * scale))
-    return img.resize(new_wh, Image.BICUBIC)
-
-# -------------------------------------------------------------------#
-#  VQA Inference – fixed (matches Qwen2VLChat.generate_inner)         #
-# -------------------------------------------------------------------#
 def vqa(image_path: str,
         question: str,
         dataset: str | None = None,
@@ -248,41 +134,21 @@ def compute_accuracy(recs: List[Dict[str, Any]]) -> float:
 # ------------------------------------------------------------------ #
 def main():
     ap = argparse.ArgumentParser(description="Batch VQA for ChartQA splits")
-    ap.add_argument("--test_human",     required=True)
-    ap.add_argument("--test_augmented", required=True)
     ap.add_argument("--img_root",       required=True)
-    ap.add_argument("--out",            required=True,
-                    help="Output predictions JSON (full path or filename)")
-    ap.add_argument("--model", default=MODEL_ID,
-                    help="HF model id (default Qwen2‑VL‑7B‑Instruct)")
+    ap.add_argument("--result_file",            required=True,
+                    help="Output predictions JSONL (full path or filename)")
     args = ap.parse_args()
 
     t0 = time.time()
 
     # read the two input JSONs
-    with open(args.test_human, "r") as f:
-        human_entries = json.load(f)
-    with open(args.test_augmented, "r") as f:
-        aug_entries = json.load(f)
+    results = []
+    with open(args.result_file, "r", encoding="utf-8") as f:
+        for line in f:
+            ex = json.loads(line)
+            results.append(ex)
 
-    # inference
-    preds_h = run_split(human_entries, args.img_root, "test_human", args.model)
-    preds_a = run_split(aug_entries,  args.img_root, "test_augmented", args.model)
-    all_preds = preds_h + preds_a
-
-    # save predictions
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w") as f:
-        json.dump(all_preds, f, indent=2)
-
-    # evaluation
-    acc_h = compute_accuracy(preds_h)
-    acc_a = compute_accuracy(preds_a)
-    total = len(preds_h) + len(preds_a)
-    acc_o = (
-        (acc_h * len(preds_h) + acc_a * len(preds_a)) / total
-        if total else 0.0
-    )
+    acc = compute_accuracy(results)
 
     # save evaluation
     eval_json = {
